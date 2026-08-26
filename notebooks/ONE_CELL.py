@@ -24,13 +24,13 @@ WRITE_TOKEN = user_secrets.get_secret("WRITE_TK")
 print("Secrets loaded.")
 
 CONFIG = {
-    'vocab_size': 50257, 'n_layers': 32, 'n_heads': 32, 'n_kv_heads': 8,
-    'd_model': 4096, 'd_ff': 11008, 'max_seq_len': 2048, 'dropout': 0.1,
-    'norm_eps': 1e-6, 'rope_theta': 10000.0, 'batch_size': 2, 'grad_accum': 64,
-    'lr': 5e-5, 'weight_decay': 0.1, 'warmup_steps': 200, 'max_steps': 5000,
+    'vocab_size': 50257, 'n_layers': 40, 'n_heads': 32, 'n_kv_heads': 8,
+    'd_model': 4096, 'd_ff': 11008, 'max_seq_len': 2048, 'dropout': 0.0,
+    'norm_eps': 1e-6, 'rope_theta': 10000.0, 'batch_size': 1, 'grad_accum': 128,
+    'lr': 3e-5, 'weight_decay': 0.1, 'warmup_steps': 300, 'max_steps': 5000,
     'min_lr_ratio': 0.1, 'max_grad_norm': 1.0, 'checkpoint_every': 500,
-    'eval_every': 250, 'eval_steps': 30, 'log_every': 10, 'max_time_hours': 8.5,
-    'save_top_k': 3, 'max_buffer_samples': 1500000, 'gradient_checkpointing': True,
+    'eval_every': 250, 'eval_steps': 20, 'log_every': 10, 'max_time_hours': 8.5,
+    'save_top_k': 3, 'gradient_checkpointing': True,
 }
 
 class RMSNorm(nn.Module):
@@ -149,38 +149,21 @@ class KortexModel(nn.Module):
             idx = torch.cat((idx, torch.multinomial(F.softmax(logits, dim=-1), 1)), dim=1)
         return idx
 
-class StreamingBuffer:
-    def __init__(self, seq_len=2048, max_tokens=15000000):
-        self.seq_len = seq_len
+class TokenStream:
+    def __init__(self, max_tokens=50000000):
         self.max_tokens = max_tokens
-        self.buffer = []
-        self.samples_seen = 0
-    def fill(self, iterator, tok_fn, max_samples=1500000):
-        count = 0
-        for item in iterator:
-            if count >= max_samples: break
-            code = item.get('code', '') or item.get('text', '')
-            if len(code) < 50: continue
-            self.buffer.extend(tok_fn(code[:8000]))
-            self.samples_seen += 1; count += 1
-            if len(self.buffer) > self.max_tokens:
-                self.buffer = self.buffer[-self.max_tokens:]
-            if count % 10000 == 0:
-                print(f"  {count} samples, {len(self.buffer)} tokens, {len(self.buffer)*4/1e9:.2f}GB RAM")
-                xm.mark_step() if str(DEVICE).startswith('xla') else None
-        print(f"  Done: {count} samples, {len(self.buffer)} tokens, {len(self.buffer)*4/1e9:.2f}GB RAM")
-    def get_batch(self, batch_size):
-        needed = (self.seq_len + 1) * batch_size
-        if len(self.buffer) < needed: return None
-        xs, ys = [], []
-        for _ in range(batch_size):
-            i = torch.randint(0, max(1, len(self.buffer) - self.seq_len - 1), (1,)).item()
-            chunk = self.buffer[i:i + self.seq_len + 1]
-            if len(chunk) < self.seq_len + 1: continue
-            xs.append(chunk[:-1]); ys.append(chunk[1:])
-        if len(xs) < batch_size: return None
-        return torch.tensor(xs, dtype=torch.long), torch.tensor(ys, dtype=torch.long)
-    def __len__(self): return len(self.buffer)
+        self.tokens = []
+        self.pos = 0
+    def add(self, new_tokens):
+        self.tokens.extend(new_tokens)
+        if len(self.tokens) > self.max_tokens:
+            self.tokens = self.tokens[-self.max_tokens:]
+    def sample(self, seq_len):
+        if len(self.tokens) < seq_len + 1: return None
+        i = torch.randint(0, len(self.tokens) - seq_len - 1, (1,)).item()
+        chunk = self.tokens[i:i + seq_len + 1]
+        return torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long)
+    def __len__(self): return len(self.tokens)
 
 class CosineScheduler:
     def __init__(self, opt, warmup, max_steps, min_lr=0.1):
@@ -217,16 +200,22 @@ def push_hf(path, token, name="kortex"):
 print("Initializing Kortex...")
 model = KortexModel(CONFIG).to(DEVICE)
 if CONFIG.get('gradient_checkpointing'):
-    print("Enabling gradient checkpointing to save VRAM...")
-    for layer in model.layers:
-        layer.gradient_checkpointing = True
-    def _ckpt_forward(self, x, cos, sin, mask=None):
-        def custom_forward(*inputs):
-            return self._forward_impl(*inputs)
-        return torch.utils.checkpoint.checkpoint(custom_forward, x, cos, sin, mask, use_reentrant=False)
-    for layer in model.layers:
-        layer._forward_impl = layer.forward
-        layer.forward = lambda x, cos, sin, mask=None, l=layer: l._forward_impl(x, cos, sin, mask)
+    print("Enabling gradient checkpointing...")
+    for i, layer in enumerate(model.layers):
+        orig_fwd = layer.forward
+        def make_ckpt_fwd(bl):
+            def ckpt_fwd(x, cos, sin, mask=None):
+                def inner(x2, cos2, sin2, mask2):
+                    return bl.norm2(x2 + bl.attn(bl.norm1(x2), cos2, sin2, mask2))
+                x = x + torch.utils.checkpoint.checkpoint(
+                    lambda x2: bl.attn(bl.norm1(x2), cos, sin, mask), x, use_reentrant=False
+                )
+                x = x + torch.utils.checkpoint.checkpoint(
+                    lambda x2: bl.ffn(bl.norm2(x2)), x, use_reentrant=False
+                )
+                return x
+            return ckpt_fwd
+        layer.forward = make_ckpt_fwd(layer)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'], betas=(0.9, 0.95))
 scheduler = CosineScheduler(optimizer, CONFIG['warmup_steps'], CONFIG['max_steps'], CONFIG['min_lr_ratio'])
@@ -291,20 +280,33 @@ del ds; gc.collect()
 
 def encode(text): return tok.encode(text).ids
 
-print("Streaming data into buffer (1.5M samples, ~15M tokens)...")
+print("Streaming dataset into token buffer (50M tokens max, ~200MB RAM)...")
 ds = load_dataset('angie-chen55/python-github-code', split='train', streaming=True)
-buffer = StreamingBuffer(seq_len=CONFIG['max_seq_len'], max_tokens=15000000)
-buffer.fill(iter(ds), encode, max_samples=1500000)
+stream = TokenStream(max_tokens=50000000)
+c = 0
+for item in ds:
+    code = item.get('code', '') or item.get('text', '')
+    if len(code) > 50:
+        stream.add(encode(code[:8000]))
+        c += 1
+    if c >= 1500000: break
+    if c % 100000 == 0 and c > 0:
+        print(f"  {c} samples streamed, {len(stream)} tokens ({len(stream)*4/1e6:.0f}MB RAM)")
+        xm.mark_step() if str(DEVICE).startswith('xla') else None
+print(f"  Done: {c} samples, {len(stream)} tokens ({len(stream)*4/1e6:.0f}MB RAM)")
 del ds; gc.collect()
 
 load_ckpt()
 nparams = sum(p.numel() for p in model.parameters())
 print(f"\n{'='*60}")
-print(f"KORTEX TRAINING v3")
-print(f"Model: {nparams/1e9:.2f}B params | Layers: {CONFIG['n_layers']} | d_model: {CONFIG['d_model']}")
-print(f"Budget: {CONFIG['max_time_hours']}h | Steps: {CONFIG['max_steps']} | Batch: {CONFIG['batch_size']}x{CONFIG['grad_accum']}={CONFIG['batch_size']*CONFIG['grad_accum']}")
-print(f"Buffer: {len(buffer)} tokens ({len(buffer)*4/1e9:.1f}GB) | Seq: {CONFIG['max_seq_len']}")
-print(f"Grad checkpointing: {CONFIG.get('gradient_checkpointing', False)}")
+print(f"KORTEX v4 — MAXIMUM MODEL")
+print(f"Model:   {nparams/1e9:.2f}B params | {CONFIG['n_layers']} layers | d={CONFIG['d_model']} | ff={CONFIG['d_ff']}")
+print(f"Heads:   {CONFIG['n_heads']}Q / {CONFIG['n_kv_heads']}KV | head_dim={CONFIG['d_model']//CONFIG['n_heads']}")
+print(f"Train:   {CONFIG['max_time_hours']}h budget | {CONFIG['max_steps']} max steps")
+print(f"Batch:   {CONFIG['batch_size']} x {CONFIG['grad_accum']} = {CONFIG['batch_size']*CONFIG['grad_accum']} effective")
+print(f"LR:      {CONFIG['lr']} | warmup={CONFIG['warmup_steps']} | cosine decay")
+print(f"Buffer:  {len(stream)} tokens | seq_len={CONFIG['max_seq_len']}")
+print(f"Ckpt:    grad_checkpointing={'ON' if CONFIG.get('gradient_checkpointing') else 'OFF'}")
 print(f"{'='*60}")
 
 grad_accum_count = 0
@@ -315,17 +317,24 @@ while global_step < CONFIG['max_steps']:
     if elapsed >= MAX_SECONDS: print(f"\nTIME LIMIT ({CONFIG['max_time_hours']}h). Stopping."); break
     if (MAX_SECONDS - elapsed) / 3600 < 0.5: print("\n<30min left. Final save."); break
 
-    batch = buffer.get_batch(CONFIG['batch_size'])
+    batch = stream.sample(CONFIG['max_seq_len'])
     if batch is None:
-        print("Refilling buffer...")
+        print("Buffer empty, refilling...")
         try:
             ds = load_dataset('angie-chen55/python-github-code', split='train', streaming=True)
-            buffer.fill(iter(ds), encode, max_samples=500000)
+            c2 = 0
+            for item in ds:
+                code = item.get('code', '') or item.get('text', '')
+                if len(code) > 50:
+                    stream.add(encode(code[:8000]))
+                    c2 += 1
+                if c2 >= 500000: break
             del ds; gc.collect()
+            print(f"  Refilled: +{c2} samples, now {len(stream)} tokens")
         except Exception as e: print(f"  Refill err: {e}"); time.sleep(10)
         continue
 
-    x, y = batch[0].to(DEVICE), batch[1].to(DEVICE)
+    x, y = batch[0].unsqueeze(0).to(DEVICE), batch[1].unsqueeze(0).to(DEVICE)
     with torch.amp.autocast(device_type='xla', dtype=torch.bfloat16, enabled=True):
         _, loss = model(x, targets=y)
     loss.backward()
@@ -347,9 +356,9 @@ while global_step < CONFIG['max_steps']:
             model.eval(); el, ec = 0, 0
             with torch.no_grad():
                 for _ in range(CONFIG['eval_steps']):
-                    eb = buffer.get_batch(CONFIG['batch_size'])
+                    eb = stream.sample(CONFIG['max_seq_len'])
                     if eb is None: break
-                    ex, ey = eb[0].to(DEVICE), eb[1].to(DEVICE)
+                    ex, ey = eb[0].unsqueeze(0).to(DEVICE), eb[1].unsqueeze(0).to(DEVICE)
                     with torch.amp.autocast(device_type='xla', dtype=torch.bfloat16, enabled=True):
                         _, l = model(ex, targets=ey)
                     el += l.item(); ec += 1
@@ -373,7 +382,7 @@ fc = {'model_state': model.state_dict(), 'config': CONFIG, 'global_step': global
 xser.save(fc, f'{fp}/kortex_final.pt') if str(DEVICE).startswith('xla') else torch.save(fc, f'{fp}/kortex_final.pt')
 shutil.copy(TOKENIZER_PATH, f'{fp}/tokenizer.json')
 with open(f'{fp}/config.json', 'w') as f: json.dump(CONFIG, f, indent=2)
-push_github(WRITE_TOKEN, "Final model save")
+push_github(WRITE_TOKEN, "Final 7B model save")
 push_hf(fp, HF_TOKEN)
 
 print("\nTesting generation...")
