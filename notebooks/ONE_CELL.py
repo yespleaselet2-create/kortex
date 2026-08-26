@@ -24,13 +24,13 @@ WRITE_TOKEN = user_secrets.get_secret("WRITE_TK")
 print("Secrets loaded.")
 
 CONFIG = {
-    'vocab_size': 50257, 'n_layers': 24, 'n_heads': 16, 'n_kv_heads': 4,
-    'd_model': 1024, 'd_ff': 2816, 'max_seq_len': 1024, 'dropout': 0.1,
-    'norm_eps': 1e-6, 'rope_theta': 10000.0, 'batch_size': 4, 'grad_accum': 16,
-    'lr': 3e-4, 'weight_decay': 0.1, 'warmup_steps': 500, 'max_steps': 30000,
+    'vocab_size': 50257, 'n_layers': 32, 'n_heads': 32, 'n_kv_heads': 8,
+    'd_model': 2048, 'd_ff': 5504, 'max_seq_len': 2048, 'dropout': 0.1,
+    'norm_eps': 1e-6, 'rope_theta': 10000.0, 'batch_size': 4, 'grad_accum': 32,
+    'lr': 1e-4, 'weight_decay': 0.1, 'warmup_steps': 500, 'max_steps': 10000,
     'min_lr_ratio': 0.1, 'max_grad_norm': 1.0, 'checkpoint_every': 500,
     'eval_every': 250, 'eval_steps': 50, 'log_every': 10, 'max_time_hours': 8.5,
-    'save_top_k': 3,
+    'save_top_k': 3, 'max_buffer_samples': 1000000,
 }
 
 class RMSNorm(nn.Module):
@@ -148,23 +148,29 @@ class KortexModel(nn.Module):
             idx = torch.cat((idx, torch.multinomial(F.softmax(logits, dim=-1), 1)), dim=1)
         return idx
 
-class CodeStreamBuffer:
-    def __init__(self, seq_len=1024):
-        self.seq_len, self.buffer, self.samples_seen = seq_len, [], 0
-    def fill(self, iterator, tok_fn, max_samples=500000):
+class StreamingBuffer:
+    def __init__(self, seq_len=2048, max_tokens=20000000):
+        self.seq_len = seq_len
+        self.max_tokens = max_tokens
+        self.buffer = []
+        self.samples_seen = 0
+    def fill(self, iterator, tok_fn, max_samples=1000000):
         count = 0
         for item in iterator:
             if count >= max_samples: break
             code = item.get('code', '') or item.get('text', '')
             if len(code) < 50: continue
-            self.buffer.extend(tok_fn(code[:5000]))
+            self.buffer.extend(tok_fn(code[:8000]))
             self.samples_seen += 1; count += 1
+            if len(self.buffer) > self.max_tokens:
+                self.buffer = self.buffer[-self.max_tokens:]
             if count % 10000 == 0:
-                print(f"  {count} samples, {len(self.buffer)} tokens")
+                print(f"  {count} samples, {len(self.buffer)} tokens, {len(self.buffer)*4/1e9:.2f}GB RAM")
                 xm.mark_step() if str(DEVICE).startswith('xla') else None
-        print(f"  Done: {count} samples, {len(self.buffer)} tokens")
+        print(f"  Done: {count} samples, {len(self.buffer)} tokens, {len(self.buffer)*4/1e9:.2f}GB RAM")
     def get_batch(self, batch_size):
-        if len(self.buffer) < (self.seq_len + 1) * batch_size: return None
+        needed = (self.seq_len + 1) * batch_size
+        if len(self.buffer) < needed: return None
         xs, ys = [], []
         for _ in range(batch_size):
             i = torch.randint(0, max(1, len(self.buffer) - self.seq_len - 1), (1,)).item()
@@ -172,8 +178,8 @@ class CodeStreamBuffer:
             if len(chunk) < self.seq_len + 1: continue
             xs.append(chunk[:-1]); ys.append(chunk[1:])
         if len(xs) < batch_size: return None
-        self.buffer = self.buffer[batch_size * self.seq_len // 2:]
         return torch.tensor(xs, dtype=torch.long), torch.tensor(ys, dtype=torch.long)
+    def __len__(self): return len(self.buffer)
 
 class CosineScheduler:
     def __init__(self, opt, warmup, max_steps, min_lr=0.1):
@@ -261,8 +267,8 @@ with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
     c = 0
     for item in ds:
         code = item.get('code', '') or item.get('text', '')
-        if len(code) > 50: f.write(code[:5000] + '\n'); c += 1
-        if c >= 100000: break
+        if len(code) > 50: f.write(code[:8000] + '\n'); c += 1
+        if c >= 200000: break
     tf = f.name
 tok.train([tf], trainer)
 TOKENIZER_PATH = '/kaggle/working/kortex-output/tokenizer.json'
@@ -272,14 +278,15 @@ del ds; gc.collect()
 
 def encode(text): return tok.encode(text).ids
 
-print("Loading data...")
+print("Streaming data into buffer (1M samples, ~20M tokens)...")
 ds = load_dataset('angie-chen55/python-github-code', split='train', streaming=True)
-buffer = CodeStreamBuffer(seq_len=CONFIG['max_seq_len'])
-buffer.fill(iter(ds), encode, max_samples=500000)
+buffer = StreamingBuffer(seq_len=CONFIG['max_seq_len'], max_tokens=20000000)
+buffer.fill(iter(ds), encode, max_samples=1000000)
 del ds; gc.collect()
 
 load_ckpt()
 print(f"\nTraining: budget={CONFIG['max_time_hours']}h steps={CONFIG['max_steps']} batch={CONFIG['batch_size']*CONFIG['grad_accum']}")
+print(f"Model: ~{sum(p.numel() for p in model.parameters())/1e6:.0f}M params | Buffer: {len(buffer)} tokens")
 print("="*60)
 
 grad_accum_count = 0
@@ -295,7 +302,7 @@ while global_step < CONFIG['max_steps']:
         print("Refilling buffer...")
         try:
             ds = load_dataset('angie-chen55/python-github-code', split='train', streaming=True)
-            buffer.fill(iter(ds), encode, max_samples=250000)
+            buffer.fill(iter(ds), encode, max_samples=500000)
             del ds; gc.collect()
         except Exception as e: print(f"  Refill err: {e}"); time.sleep(10)
         continue
@@ -334,6 +341,7 @@ while global_step < CONFIG['max_steps']:
                 if is_best: best_val_loss = avg_eval
                 print(f"  EVAL step={global_step} loss={avg_eval:.4f} {'[BEST]' if is_best else ''}")
                 save_ckpt(global_step, avg_eval, is_best)
+            model.train()
 
         if global_step % CONFIG['checkpoint_every'] == 0 and global_step % CONFIG['eval_every'] != 0:
             save_ckpt(global_step)
