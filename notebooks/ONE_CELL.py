@@ -25,12 +25,12 @@ print("Secrets loaded.")
 
 CONFIG = {
     'vocab_size': 50257, 'n_layers': 32, 'n_heads': 32, 'n_kv_heads': 8,
-    'd_model': 2048, 'd_ff': 5504, 'max_seq_len': 2048, 'dropout': 0.1,
-    'norm_eps': 1e-6, 'rope_theta': 10000.0, 'batch_size': 4, 'grad_accum': 32,
-    'lr': 1e-4, 'weight_decay': 0.1, 'warmup_steps': 500, 'max_steps': 10000,
+    'd_model': 4096, 'd_ff': 11008, 'max_seq_len': 2048, 'dropout': 0.1,
+    'norm_eps': 1e-6, 'rope_theta': 10000.0, 'batch_size': 2, 'grad_accum': 64,
+    'lr': 5e-5, 'weight_decay': 0.1, 'warmup_steps': 200, 'max_steps': 5000,
     'min_lr_ratio': 0.1, 'max_grad_norm': 1.0, 'checkpoint_every': 500,
-    'eval_every': 250, 'eval_steps': 50, 'log_every': 10, 'max_time_hours': 8.5,
-    'save_top_k': 3, 'max_buffer_samples': 1000000,
+    'eval_every': 250, 'eval_steps': 30, 'log_every': 10, 'max_time_hours': 8.5,
+    'save_top_k': 3, 'max_buffer_samples': 1500000, 'gradient_checkpointing': True,
 }
 
 class RMSNorm(nn.Module):
@@ -124,7 +124,8 @@ class KortexModel(nn.Module):
         self.norm = RMSNorm(cfg['d_model'], cfg['norm_eps'])
         self.lm_head = nn.Linear(cfg['d_model'], cfg['vocab_size'], bias=False)
         self.apply(self._init_weights)
-        print(f"KortexModel: {sum(p.numel() for p in self.parameters())/1e6:.1f}M params")
+        nparams = sum(p.numel() for p in self.parameters())
+        print(f"KortexModel: {nparams/1e9:.2f}B params ({nparams/1e6:.0f}M)")
     def _init_weights(self, m):
         if isinstance(m, nn.Linear): torch.nn.init.normal_(m.weight, std=0.02)
         elif isinstance(m, nn.Embedding): torch.nn.init.normal_(m.weight, std=0.02)
@@ -149,12 +150,12 @@ class KortexModel(nn.Module):
         return idx
 
 class StreamingBuffer:
-    def __init__(self, seq_len=2048, max_tokens=20000000):
+    def __init__(self, seq_len=2048, max_tokens=15000000):
         self.seq_len = seq_len
         self.max_tokens = max_tokens
         self.buffer = []
         self.samples_seen = 0
-    def fill(self, iterator, tok_fn, max_samples=1000000):
+    def fill(self, iterator, tok_fn, max_samples=1500000):
         count = 0
         for item in iterator:
             if count >= max_samples: break
@@ -215,6 +216,18 @@ def push_hf(path, token, name="kortex"):
 
 print("Initializing Kortex...")
 model = KortexModel(CONFIG).to(DEVICE)
+if CONFIG.get('gradient_checkpointing'):
+    print("Enabling gradient checkpointing to save VRAM...")
+    for layer in model.layers:
+        layer.gradient_checkpointing = True
+    def _ckpt_forward(self, x, cos, sin, mask=None):
+        def custom_forward(*inputs):
+            return self._forward_impl(*inputs)
+        return torch.utils.checkpoint.checkpoint(custom_forward, x, cos, sin, mask, use_reentrant=False)
+    for layer in model.layers:
+        layer._forward_impl = layer.forward
+        layer.forward = lambda x, cos, sin, mask=None, l=layer: l._forward_impl(x, cos, sin, mask)
+
 optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'], betas=(0.9, 0.95))
 scheduler = CosineScheduler(optimizer, CONFIG['warmup_steps'], CONFIG['max_steps'], CONFIG['min_lr_ratio'])
 global_step = 0
@@ -278,16 +291,21 @@ del ds; gc.collect()
 
 def encode(text): return tok.encode(text).ids
 
-print("Streaming data into buffer (1M samples, ~20M tokens)...")
+print("Streaming data into buffer (1.5M samples, ~15M tokens)...")
 ds = load_dataset('angie-chen55/python-github-code', split='train', streaming=True)
-buffer = StreamingBuffer(seq_len=CONFIG['max_seq_len'], max_tokens=20000000)
-buffer.fill(iter(ds), encode, max_samples=1000000)
+buffer = StreamingBuffer(seq_len=CONFIG['max_seq_len'], max_tokens=15000000)
+buffer.fill(iter(ds), encode, max_samples=1500000)
 del ds; gc.collect()
 
 load_ckpt()
-print(f"\nTraining: budget={CONFIG['max_time_hours']}h steps={CONFIG['max_steps']} batch={CONFIG['batch_size']*CONFIG['grad_accum']}")
-print(f"Model: ~{sum(p.numel() for p in model.parameters())/1e6:.0f}M params | Buffer: {len(buffer)} tokens")
-print("="*60)
+nparams = sum(p.numel() for p in model.parameters())
+print(f"\n{'='*60}")
+print(f"KORTEX TRAINING v3")
+print(f"Model: {nparams/1e9:.2f}B params | Layers: {CONFIG['n_layers']} | d_model: {CONFIG['d_model']}")
+print(f"Budget: {CONFIG['max_time_hours']}h | Steps: {CONFIG['max_steps']} | Batch: {CONFIG['batch_size']}x{CONFIG['grad_accum']}={CONFIG['batch_size']*CONFIG['grad_accum']}")
+print(f"Buffer: {len(buffer)} tokens ({len(buffer)*4/1e9:.1f}GB) | Seq: {CONFIG['max_seq_len']}")
+print(f"Grad checkpointing: {CONFIG.get('gradient_checkpointing', False)}")
+print(f"{'='*60}")
 
 grad_accum_count = 0
 train_losses = []
