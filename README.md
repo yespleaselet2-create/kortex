@@ -36,7 +36,7 @@ A coding language model trained from scratch on TPU v5e-8 using Kaggle's free ti
 
 1. Upload `notebooks/train_kortex.ipynb` to Kaggle
 2. Set accelerator to **TPU v5e-8** in notebook settings
-3. Add Kaggle secrets: `HF` (HuggingFace token), `WRITE_TOKEN` (GitHub token)
+3. Add Kaggle secrets: `HF` (HuggingFace token), `WRITE_TK` (GitHub token)
 4. Run all cells
 
 ## Repository Structure
