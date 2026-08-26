@@ -1,0 +1,54 @@
+{
+  "model": {
+    "vocab_size": 50257,
+    "n_layers": 24,
+    "n_heads": 16,
+    "n_kv_heads": 4,
+    "d_model": 1024,
+    "d_ff": 2816,
+    "max_seq_len": 1024,
+    "dropout": 0.1,
+    "norm_eps": 1e-6,
+    "rope_theta": 10000.0,
+    "tie_word_embeddings": false,
+    "use_rmsnorm": true,
+    "use_swiglu": true,
+    "use_gqa": true
+  },
+  "training": {
+    "batch_size": 4,
+    "gradient_accumulation_steps": 16,
+    "effective_batch_size": 64,
+    "learning_rate": 3e-4,
+    "weight_decay": 0.1,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.95,
+    "adam_eps": 1e-8,
+    "max_grad_norm": 1.0,
+    "warmup_steps": 500,
+    "max_steps": 30000,
+    "lr_scheduler": "cosine",
+    "min_lr_ratio": 0.1,
+    "bf16": true,
+    "checkpoint_every": 500,
+    "eval_every": 250,
+    "eval_steps": 50,
+    "log_every": 10,
+    "max_time_hours": 8.5,
+    "save_top_k": 3
+  },
+  "data": {
+    "dataset_name": "codeparrot/github-code",
+    "streaming": true,
+    "max_samples": 500000,
+    "train_split": "train",
+    "text_column": "code",
+    "min_code_length": 50,
+    "max_code_length": 5000
+  },
+  "tokenizer": {
+    "name": "kortex-code-tokenizer",
+    "vocab_size": 50257,
+    "min_frequency": 2
+  }
+}
