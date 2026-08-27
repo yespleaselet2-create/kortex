@@ -24,8 +24,8 @@ WRITE_TOKEN = user_secrets.get_secret("WRITE_TK")
 print("Secrets loaded.")
 
 CONFIG = {
-    'vocab_size': 50257, 'n_layers': 40, 'n_heads': 32, 'n_kv_heads': 8,
-    'd_model': 4096, 'd_ff': 11008, 'max_seq_len': 2048, 'dropout': 0.0,
+    'vocab_size': 50257, 'n_layers': 32, 'n_heads': 32, 'n_kv_heads': 8,
+    'd_model': 3584, 'd_ff': 9216, 'max_seq_len': 2048, 'dropout': 0.0,
     'norm_eps': 1e-6, 'rope_theta': 10000.0, 'batch_size': 1, 'grad_accum': 128,
     'lr': 3e-5, 'weight_decay': 0.1, 'warmup_steps': 300, 'max_steps': 5000,
     'min_lr_ratio': 0.1, 'max_grad_norm': 1.0, 'checkpoint_every': 500,
